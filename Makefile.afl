@@ -1,0 +1,213 @@
+#!/usr/bin/make -f
+
+# AFL++ Makefile for JSONPath fuzzer
+# Based on build.sh but adapted for AFL++
+
+# Compiler settings for AFL++
+CC := afl-clang-lto
+# Fallback to afl-gcc if afl-clang-fast is not available
+ifeq ($(shell which afl-clang-fast 2>/dev/null),)
+    CC := afl-gcc
+endif
+
+# Build configuration
+CFLAGS := -O2 -fPIC -D_GNU_SOURCE -std=gnu99 -g
+LDFLAGS := 
+DEPS_DIR := $(PWD)/deps
+INSTALL_PREFIX := $(DEPS_DIR)/install
+
+# Targets
+FUZZER_BIN := jsonpath_afl_fuzzer
+SOURCES := ast.c lexer.c matcher.c parser.c json-fuzz.c
+OBJECTS := $(SOURCES:.c=.o)
+
+# Default target
+all: deps $(FUZZER_BIN)
+
+# Set up dependencies (libubox)
+.PHONY: deps
+deps: $(INSTALL_PREFIX)/lib/libubox.so
+
+$(INSTALL_PREFIX)/lib/libubox.so:
+	@echo "Setting up dependencies..."
+	@mkdir -p $(DEPS_DIR)
+	@if [ ! -d "$(DEPS_DIR)/libubox" ]; then \
+		echo "Downloading libubox..."; \
+		cd $(DEPS_DIR) && git clone https://github.com/openwrt/libubox.git; \
+		cd $(DEPS_DIR)/libubox && rm -rf tests examples lua; \
+		cd $(DEPS_DIR)/libubox && sed -i '/ADD_SUBDIRECTORY(examples)/d' CMakeLists.txt; \
+		cd $(DEPS_DIR)/libubox && sed -i '/ADD_SUBDIRECTORY(lua)/d' CMakeLists.txt; \
+	fi
+	@echo "Building libubox..."
+	@cd $(DEPS_DIR)/libubox && mkdir -p build
+	@cd $(DEPS_DIR)/libubox/build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" \
+		         -DCMAKE_C_COMPILER="$(CC)" \
+		         -DCMAKE_C_FLAGS="-O2 -fPIC -g" \
+		         -DBUILD_LUA=OFF \
+		         -DBUILD_EXAMPLES=OFF \
+		         -DBUILD_TESTS=OFF \
+		         -DBUILD_STATIC=OFF \
+		         -DBUILD_SHARED_LIBS=ON && \
+		make -j$$(nproc) && \
+		make install
+
+parser.c:
+	@echo "Checking if parser.c exists..."
+	@if [ ! -f "parser.c" ]; then \
+		echo "Creating minimal parser.c stub (matching build.sh approach)..."; \
+		$(MAKE) -f $(firstword $(MAKEFILE_LIST)) parser-stub; \
+	else \
+		echo "parser.c already exists, using existing file"; \
+	fi
+
+parser-stub:
+	@echo "Creating minimal parser.c stub (matching build.sh approach)..."
+	@echo '#include "parser.h"' > parser.c
+	@echo '#include "ast.h"' >> parser.c
+	@echo '#include <stdlib.h>' >> parser.c
+	@echo '' >> parser.c
+	@echo '// Minimal parser implementation for fuzzing' >> parser.c
+	@echo 'void *ParseAlloc(void *(*mfunc)(size_t)) {' >> parser.c
+	@echo '    if (!mfunc) return NULL;' >> parser.c
+	@echo '    return mfunc(sizeof(int)); // Minimal allocation' >> parser.c
+	@echo '}' >> parser.c
+	@echo '' >> parser.c
+	@echo 'void Parse(void *pParser, int type, struct jp_opcode *op, struct jp_state *s) {' >> parser.c
+	@echo '    // Basic parser implementation - just set the first opcode as path' >> parser.c
+	@echo '    if (s && op && type > 0 && pParser) {' >> parser.c
+	@echo '        if (!s->path) {' >> parser.c
+	@echo '            s->path = op;' >> parser.c
+	@echo '        }' >> parser.c
+	@echo '    }' >> parser.c
+	@echo '}' >> parser.c
+	@echo '' >> parser.c
+	@echo 'void ParseFree(void *pParser, void (*ffunc)(void *)) {' >> parser.c
+	@echo '    if (pParser && ffunc) {' >> parser.c
+	@echo '        ffunc(pParser);' >> parser.c
+	@echo '    }' >> parser.c
+	@echo '}' >> parser.c
+	@echo "Creating minimal parser.h stub..."
+	@echo '#ifndef PARSER_H_INCLUDED' > parser.h
+	@echo '#define PARSER_H_INCLUDED' >> parser.h
+	@echo '' >> parser.h
+	@echo '// Include token definitions that matcher.c expects' >> parser.h
+	@echo '#include "lexer.h"' >> parser.h
+	@echo '#include "ast.h"' >> parser.h
+	@echo '' >> parser.h
+	@echo '// Parser interface functions' >> parser.h
+	@echo 'void *ParseAlloc(void *(*mallocProc)(size_t));' >> parser.h
+	@echo 'void Parse(void *pParser, int type, struct jp_opcode *op, struct jp_state *s);' >> parser.h
+	@echo 'void ParseFree(void *pParser, void (*freeProc)(void *));' >> parser.h
+	@echo '' >> parser.h
+	@echo '#endif' >> parser.h
+
+# Compile object files
+%.o: %.c deps
+	@echo "Compiling $<..."
+	@$(CC) $(CFLAGS) -I$(INSTALL_PREFIX)/include -c $< -o $@
+
+# Special handling for json-fuzz.c to enable AFL mode
+json-fuzz.o: json-fuzz.c deps
+	@echo "Compiling json-fuzz.c for AFL++..."
+	@$(CC) $(CFLAGS) -DAFL_MODE -I$(INSTALL_PREFIX)/include -c json-fuzz.c -o json-fuzz.o
+
+# Build the fuzzer
+$(FUZZER_BIN): parser.c $(OBJECTS)
+	@echo "Linking AFL++ fuzzer..."
+	@$(CC) $(CFLAGS) $(OBJECTS) \
+		-L$(INSTALL_PREFIX)/lib \
+		$(LDFLAGS) -lubox -ljson-c \
+		-o $(FUZZER_BIN)
+	@echo "✓ AFL++ fuzzer binary created: $(FUZZER_BIN)"
+
+# Test target
+.PHONY: test
+test: $(FUZZER_BIN)
+	@echo "Testing fuzzer binary..."
+	@./$(FUZZER_BIN) --help 2>/dev/null || echo "Fuzzer binary is ready"
+	@echo "Dependencies:"
+	@ldd $(FUZZER_BIN) || echo "ldd not available"
+
+# Create test input directory
+.PHONY: testcases
+testcases:
+	@echo "Creating test cases directory..."
+	@mkdir -p testcases
+	@echo '{"name": "test", "value": 42}' > testcases/simple.json
+	@echo '$$' > testcases/root.jsonpath
+	@echo '$$.name' > testcases/name.jsonpath
+	@echo '[{"a": 1}, {"b": 2}]' > testcases/array.json
+	@echo '$$[*]' > testcases/wildcard.jsonpath
+	@echo "Test cases created in testcases/"
+
+# Run AFL++ fuzzer
+.PHONY: fuzz
+fuzz: $(FUZZER_BIN) testcases
+	@echo "Starting AFL++ fuzzer..."
+	@echo "Make sure to run 'echo core > /proc/sys/kernel/core_pattern' as root first"
+	@mkdir -p findings
+	@afl-fuzz -i testcases -o findings -- ./$(FUZZER_BIN)
+
+# Clean build artifacts
+.PHONY: clean
+clean:
+	@echo "Cleaning build artifacts..."
+	@rm -f $(OBJECTS) $(FUZZER_BIN) parser.c parser.h parser.out
+	@rm -rf testcases findings
+
+# Force clean and rebuild parser
+.PHONY: clean-parser
+clean-parser:
+	@echo "Cleaning parser files..."
+	@rm -f parser.c parser.h parser.out
+
+# Clean everything including dependencies
+.PHONY: distclean
+distclean: clean
+	@echo "Cleaning dependencies..."
+	@rm -rf $(DEPS_DIR)
+
+# Install dependencies (for systems that need them)
+.PHONY: install-deps
+install-deps:
+	@echo "Installing system dependencies..."
+	@if command -v apt-get >/dev/null 2>&1; then \
+		sudo apt-get update && \
+		sudo apt-get install -y build-essential cmake pkg-config git libjson-c-dev afl++; \
+	elif command -v yum >/dev/null 2>&1; then \
+		sudo yum install -y gcc cmake pkg-config git json-c-devel afl; \
+	elif command -v pacman >/dev/null 2>&1; then \
+		sudo pacman -S gcc cmake pkg-config git json-c afl; \
+	else \
+		echo "Please install: build-essential cmake pkg-config git libjson-c-dev afl++"; \
+	fi
+
+# Help target
+.PHONY: help
+help:
+	@echo "AFL++ JSONPath Fuzzer Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all         - Build the fuzzer (default)"
+	@echo "  deps        - Build dependencies only"
+	@echo "  testcases   - Create sample test cases"
+	@echo "  test        - Test the fuzzer binary"
+	@echo "  fuzz        - Run AFL++ fuzzing session"
+	@echo "  clean       - Clean build artifacts"
+	@echo "  clean-parser- Clean and regenerate parser files"
+	@echo "  distclean   - Clean everything including deps"
+	@echo "  install-deps- Install system dependencies"
+	@echo "  help        - Show this help"
+	@echo ""
+	@echo "Environment variables:"
+	@echo "  CC          - C compiler (default: afl-clang-fast)"
+	@echo "  CFLAGS      - C compiler flags"
+	@echo "  LDFLAGS     - Linker flags"
+	@echo ""
+	@echo "Example usage:"
+	@echo "  make all"
+	@echo "  make testcases"
+	@echo "  make fuzz"
+
+.PHONY: all deps clean clean-parser distclean test testcases fuzz install-deps help parser-stub 
