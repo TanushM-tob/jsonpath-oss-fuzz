@@ -91,8 +91,11 @@ static void fuzz_jp_get_token(const uint8_t *data, size_t size) {
 
 static void fuzz_parse_and_match(const uint8_t *data, size_t size) {
     
+    if (size == 0) return;  // Handle empty input
+    
     size_t split_point = size / 3; 
     if (split_point == 0) split_point = 1;
+    if (split_point >= size) split_point = size - 1;  // Ensure split_point < size
 
     char *expr = malloc(split_point + 1);
     if (!expr) return;
@@ -130,12 +133,25 @@ static void fuzz_parse_and_match(const uint8_t *data, size_t size) {
 // Test comprehensive pipeline with error injection
 static void fuzz_full_pipeline(const uint8_t *data, size_t size) {
     
+    if (size == 0) return;  // Handle empty input
+    
     size_t expr_size = size / 4;
     size_t json_size = size / 2;
-    size_t remaining = size - expr_size - json_size;
     
     if (expr_size == 0) expr_size = 1;
     if (json_size == 0) json_size = 1;
+    
+    // Ensure sizes don't exceed input bounds
+    if (expr_size + json_size >= size) {
+        expr_size = size / 2;
+        json_size = size - expr_size;
+        if (json_size == 0) json_size = 1;
+        if (expr_size == 0) expr_size = 1;
+        if (expr_size + json_size > size) {
+            expr_size = size;
+            json_size = 0;
+        }
+    }
     
     char *expr = malloc(expr_size + 1);
     char *json_str = malloc(json_size + 1);
@@ -157,7 +173,7 @@ static void fuzz_full_pipeline(const uint8_t *data, size_t size) {
             (void)state->error_pos; 
         }
         
-        if (state->path) {
+        if (state->path && state->error_code == 0) {
             struct json_object *test_objects[] = {
                 json_tokener_parse(json_str),
                 json_object_new_object(),
@@ -333,38 +349,38 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     return 0;
 }
 
-// #ifndef __AFL_FUZZ_TESTCASE_LEN
+#ifndef __AFL_FUZZ_TESTCASE_LEN
 
-// ssize_t fuzz_len;
-// unsigned char fuzz_buf[1024000];
+ssize_t fuzz_len;
+unsigned char fuzz_buf[1024000];
 
-// #define __AFL_FUZZ_TESTCASE_LEN fuzz_len
-// #define __AFL_FUZZ_TESTCASE_BUF fuzz_buf  
-// #define __AFL_FUZZ_INIT() void sync(void);
-// #define __AFL_LOOP(x) \
-//     ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
-// #define __AFL_INIT() sync()
+#define __AFL_FUZZ_TESTCASE_LEN fuzz_len
+#define __AFL_FUZZ_TESTCASE_BUF fuzz_buf  
+#define __AFL_FUZZ_INIT() void sync(void);
+#define __AFL_LOOP(x) \
+    ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
+#define __AFL_INIT() sync()
 
-// #endif
+#endif
 
-// __AFL_FUZZ_INIT();
+__AFL_FUZZ_INIT();
 
-// #pragma clang optimize off
-// #pragma GCC optimize("O0")
+#pragma clang optimize off
+#pragma GCC optimize("O0")
 
-// int main(int argc, char **argv)
-// {
-//     (void)argc; (void)argv; 
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv; 
     
-//     ssize_t len;
-//     unsigned char *buf;
+    ssize_t len;
+    unsigned char *buf;
 
-//     __AFL_INIT();
-//     buf = __AFL_FUZZ_TESTCASE_BUF;
-//     while (__AFL_LOOP(INT_MAX)) {
-//         len = __AFL_FUZZ_TESTCASE_LEN;
-//         LLVMFuzzerTestOneInput(buf, (size_t)len);
-//     }
+    __AFL_INIT();
+    buf = __AFL_FUZZ_TESTCASE_BUF;
+    while (__AFL_LOOP(INT_MAX)) {
+        len = __AFL_FUZZ_TESTCASE_LEN;
+        LLVMFuzzerTestOneInput(buf, (size_t)len);
+    }
     
-//     return 0;
-// }
+    return 0;
+}
